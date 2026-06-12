@@ -17,6 +17,7 @@
     <packaging>pom</packaging>
 
     <modules>
+        <module>common</module>
         <module>gateway</module>
         <module>event-service</module>
         <module>search-service</module>
