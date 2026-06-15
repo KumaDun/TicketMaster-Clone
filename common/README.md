@@ -8,7 +8,7 @@ of by hoping nobody typos a string.
 
 | Class | Contract | Writer → Reader |
 |---|---|---|
-| `redis.RedisKeys` | Redis key spellings (waiting queue, admitted marker, seat hold) | queue-service → booking-service |
+| `redis.RedisKeys` | Redis key spellings (waiting queue, admitted marker, seat hold, section sold/reservations counters) | queue-service / booking-service → event-service |
 | `redis.RedisChannels` | Pub/sub channel names | see diagram below |
 | `event.EventChangeMessage` | JSON payload on the `events:changes` channel | event-service → search-service |
 

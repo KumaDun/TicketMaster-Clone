@@ -32,15 +32,16 @@ to Kubernetes / Azure (phase 2).
 | Module            | Responsibility                                                        | Key dependencies              |
 |-------------------|-----------------------------------------------------------------------|-------------------------------|
 | `gateway`         | Single entry point: routing, rate limiting, auth                      | Web, Actuator                 |
-| `event-service`   | Event/venue/performer catalog (CRUD), seat map with section grouping; publishes index events | Web, JPA, PostgreSQL, Validation |
+| `event-service`   | Event/venue/performer catalog (CRUD), seat map with section grouping; serves dynamic per-section availability; publishes index events | Web, JPA, PostgreSQL, Validation, **Data Redis** (pub/sub publish + read-only counter reads) |
 | `search-service`  | Keyword/filter search backed by ElasticSearch; indexer consumes change events via Redis pub/sub | Web, Data Elasticsearch, Data Redis |
 | `queue-service`   | Virtual waiting queue: Redis sorted set, admission worker, admitted set with TTL, WebSocket position updates | Web, WebSocket, Data Redis    |
 | `booking-service` | Admission-token-gated booking: Redis seat holds (TTL), booking confirmation in short Postgres transactions, payment webhook | Web, JPA, PostgreSQL, Data Redis, Validation |
-| `common` (planned)| Shared DTOs and constants                                             | —                             |
+| `common`          | Shared contracts: Redis key/channel names, cross-service message records | —                             |
 
 ### Core design decisions
 
-- **Seat map is static** — no real-time seat availability display. Seats are grouped by section; correctness is enforced at booking time, not display time.
+- **Seat map is static, but section counts are live** — individual seat status is never shown (that view is expensive and just stokes "seats vanishing" anxiety). Seats are grouped by section; per-seat correctness is enforced at booking time, not display time. What *is* shown and updated dynamically is a per-section count — "Section A: 42 left" — computed conservatively (see below).
+- **Conservative section availability** — `section_available = capacity − sold − active_reservations`, where a reservation covers both Redis seat holds *and* admitted-but-not-yet-bought queue users. Counting admitted users is deliberate: we assume everyone we let through will complete a purchase, so the queue never admits more people than a section can actually serve. The live pieces live in Redis: a permanent `section:sold` counter (incremented in the confirm transaction) and a `section:reservations` sorted set keyed by expiry timestamp (pruned lazily via `ZREMRANGEBYSCORE` on read — no cron, consistent with the implicit-TTL philosophy below). event-service reads these counters read-only; queue-service and booking-service own the writes.
 - **Virtual queue before booking** — users wanting to book are placed in a Redis sorted-set queue (score = enqueue time). An admission worker periodically moves the top-N into an *admitted set* (with TTL) and issues an admission token. Position updates are pushed to the browser over WebSocket via Redis pub/sub.
 - **No long-lived DB locks** — seat holds live in Redis with a TTL (~10 min); expiry releases them implicitly (no cron job). Final confirmation uses a short `SELECT ... FOR UPDATE` transaction in Postgres to guarantee no double-sell.
 - **Search is decoupled** — ElasticSearch is synced from Postgres via change events over Redis pub/sub (outbox-style), never dual-written by request handlers.
@@ -72,7 +73,7 @@ TicketMaster/
 ├── search-service/
 ├── queue-service/
 ├── booking-service/
-├── common/              # planned — shared DTOs
+├── common/              # shared contracts: RedisKeys, RedisChannels, EventChangeMessage
 ├── docker-compose.yml   # postgres, redis, elasticsearch (+ services later)
 ├── volume-data/         # bind-mounted state (gitignored): pgdata/, esdata/
 └── README.md

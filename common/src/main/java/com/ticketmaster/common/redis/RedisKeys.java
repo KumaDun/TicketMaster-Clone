@@ -38,6 +38,29 @@ public final class RedisKeys {
         return "booking:hold:" + eventId + ":" + seatId;
     }
 
+    /**
+     * Plain integer counter: seats SOLD in a section for an event. INCR'd by
+     * booking-service inside the confirm transaction; a fast mirror of the
+     * authoritative Postgres count. READ by event-service to compute section
+     * availability without hitting the database on every request.
+     */
+    public static String sectionSold(long eventId, long sectionId) {
+        return "section:sold:" + eventId + ":" + sectionId;
+    }
+
+    /**
+     * Sorted set: in-flight reservations against a section's capacity.
+     * Member = holdId/userId, score = expiry timestamp (epoch millis).
+     * Covers both Redis seat holds AND admitted-but-not-yet-bought queue users
+     * (the conservative assumption: everyone admitted will buy). Expired members
+     * are pruned lazily on read via {@code ZREMRANGEBYSCORE key 0 <now>} — no cron.
+     * WRITTEN by queue-service (admissions) and booking-service (holds),
+     * READ by event-service to compute {@code available = total - sold - ZCARD}.
+     */
+    public static String sectionReservations(long eventId, long sectionId) {
+        return "section:reservations:" + eventId + ":" + sectionId;
+    }
+
     private RedisKeys() {
         // namespace class, never instantiated
     }
