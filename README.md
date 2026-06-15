@@ -48,15 +48,15 @@ to Kubernetes / Azure (phase 2).
 
 ## Tech stack & pinned versions
 
-| Component      | Version            | Notes                                                            |
-|----------------|--------------------|------------------------------------------------------------------|
-| Java           | 21 (Microsoft OpenJDK) | Spring Boot 4 baseline is 17+                                |
-| Spring Boot    | 4.0.7              | Manages all Java client library versions (see dependency-versions appendix) |
+| Component      | Version                          | Notes                                                            |
+|----------------|----------------------------------|------------------------------------------------------------------|
+| Java           | 21 (Microsoft OpenJDK)           | Spring Boot 4 baseline is 17+                                |
+| Spring Boot    | 4.0.7                            | Manages all Java client library versions (see dependency-versions appendix) |
 | Maven          | multi-module, via wrapper (`mvnw`) | Parent pom at repo root                          |
-| PostgreSQL     | `postgres:17.10`   | Source of truth: events, venues, tickets, bookings               |
-| Redis          | `redis:8.8-alpine` | Queue, admitted set, seat holds, pub/sub                         |
-| ElasticSearch  | `elasticsearch:9.2.8` | **Pinned to match** Spring Data Elasticsearch 6.0.x client (do not bump independently) |
-| Docker Compose | local orchestration | `--scale booking-service=N` to simulate multiple servers        |
+| PostgreSQL     | `postgres:17-alpine`             | Source of truth: events, venues, tickets, bookings               |
+| Redis          | `redis:8-alpine`                 | Queue, admitted set, seat holds, pub/sub                         |
+| ElasticSearch  | `elasticsearch:9.2.8`            | **Pinned to match** Spring Data Elasticsearch 6.0.x client (do not bump independently) |
+| Docker Compose | local orchestration              | `--scale booking-service=N` to simulate multiple servers        |
 
 > **Version rule:** never pick Java client library versions manually — Spring Boot's BOM decides.
 > Match *server* (container) versions to what the managed clients expect. ElasticSearch is the
@@ -73,7 +73,8 @@ TicketMaster/
 ├── queue-service/
 ├── booking-service/
 ├── common/              # planned — shared DTOs
-├── docker-compose.yml   # planned — postgres, redis, elasticsearch + services
+├── docker-compose.yml   # postgres, redis, elasticsearch (+ services later)
+├── volume-data/         # bind-mounted state (gitignored): pgdata/, esdata/
 └── README.md
 ```
 
@@ -153,13 +154,87 @@ docker compose up --scale booking-service=3   # simulate multiple booking server
 > Note: `event-service` and `booking-service` will not start without a reachable
 > PostgreSQL — that is expected until the Compose file and `application.yml` configs are in place.
 
+## Docker Compose (infrastructure)
+
+`docker-compose.yml` at the repo root brings up the three backing services —
+PostgreSQL, Redis, ElasticSearch — that every service depends on. Phase 1 runs
+only infrastructure here; the Spring services are added later.
+
+### Everyday commands
+
+```bash
+docker compose config        # validate + print the fully-resolved file (catches YAML/typos)
+docker compose up -d         # start all services detached (background)
+docker compose ps            # list running services + health status
+docker compose logs -f       # follow logs of all services (Ctrl-C stops watching, not the containers)
+docker compose logs -f elasticsearch   # follow one service
+docker compose down          # stop and remove containers (data on disk is kept)
+docker compose down -v       # also remove named volumes (N/A here — we use bind mounts)
+```
+
+> `docker compose ps` only lists what is already running. Empty output usually just
+> means nothing has been started yet — run `up -d` first. It does **not** start anything.
+
+### Data persistence — bind mounts under `volume-data/`
+
+State is persisted with **bind mounts** into a single `volume-data/` folder at the repo root:
+
+```yaml
+volumes:
+  - ./volume-data/pgdata:/var/lib/postgresql/data    # postgres
+  - ./volume-data/esdata:/usr/share/elasticsearch/data   # elasticsearch
+```
+
+- The leading `./` is what makes it a *bind mount* (a real host path). Without it,
+  Compose treats the left side as a *named volume* and demands a top-level `volumes:`
+  block declaring it — a common beginner trip-up.
+- Compose auto-creates these subfolders on first `up`; no `mkdir` needed.
+- Add `volume-data/` to `.gitignore` so database files are never committed.
+- To wipe state, stop the stack and delete the folder (`rm -rf volume-data/`). On
+  Windows/WSL2 the files may be owned by the container's internal user — if deletion
+  is blocked, remove from inside WSL with `sudo`.
+
+> **Bind mounts vs. named volumes:** named volumes (`docker volume ...`, stored in
+> Docker's own area) avoid host permission quirks but hide the data. We chose bind
+> mounts so the data is visible and trivially deletable during development.
+
+### Healthchecks — gotchas learned the hard way
+
+Every service has a healthcheck so `docker compose ps` reports real readiness, and so
+dependent services can later wait with `depends_on: condition: service_healthy`.
+
+1. **A healthcheck must test that *specific* service's real readiness.** The official
+   ElasticSearch tutorial checks for a TLS cert file (`config/certs/.../es01.crt`) — but
+   that only exists when security is enabled. With `xpack.security.enabled: false` the
+   cert is never created, so that check fails forever and the container sits `unhealthy`.
+   We check the HTTP endpoint instead: `curl -fs http://localhost:9200/_cluster/health`.
+2. **ElasticSearch is slow to boot** — a generous `start_period` (40s) matters more than
+   a huge `retries` count. Failures during `start_period` don't count against the service.
+3. **`$$` escapes a variable** so Compose passes it through to the container's shell
+   rather than substituting it itself — needed in the Postgres `pg_isready` check.
+
+### Configured services
+
+| Service       | Image                  | Port  | Health probe                       |
+|---------------|------------------------|-------|------------------------------------|
+| postgres      | `postgres:17-alpine`   | 5432  | `pg_isready -U … -d …`             |
+| redis         | `redis:8-alpine`       | 6379  | `redis-cli ping`                   |
+| elasticsearch | `elasticsearch:9.2.8`  | 9200  | `curl …/_cluster/health`           |
+
+ElasticSearch runs single-node with security disabled and heap capped at 512m
+(`ES_JAVA_OPTS: -Xms512m -Xmx512m`) — fine for local dev, not production.
+All three use `restart: unless-stopped` so they survive a host reboot.
+
+- [x] Run - `docker compose up -d` and `docker compose ps` after finishing docker-compose.yml
+
+
 ## Roadmap
 
 - [x] Service skeletons generated (Spring Initializr, Boot 4.0.7, Java 21)
 - [x] Parent pom + child pom trimming — `mvn clean install -DskipTests` builds all 6 projects
       (build with `-DskipTests` until Compose infra exists: JPA services cannot boot without Postgres)
-- [ ] `common` module
-- [ ] `docker-compose.yml` with Postgres / Redis / ElasticSearch + healthchecks (Actuator)
+- [X] `common` module
+- [x] `docker-compose.yml` with Postgres / Redis / ElasticSearch + healthchecks; bind-mounted persistence under `volume-data/`
 - [ ] Event service: schema (events, venues, performers, tickets, bookings), seed data, seat map endpoint
 - [ ] Search: ES index, pub/sub indexer, search endpoints
 - [ ] Virtual queue: sorted set + admission worker + WebSocket updates
